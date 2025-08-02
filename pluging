@@ -1,0 +1,129 @@
+using System.Collections.Generic;
+using Oxide.Core;
+using Oxide.Core.Plugins;
+using UnityEngine;
+
+namespace Oxide.Plugins
+{
+    [Info("CustomTeleportManager", "Blade", "1.0.0")]
+    [Description("Teleport to raid bases, heli towers, and home locations.")]
+    public class CustomTeleportManager : RustPlugin
+    {
+        [PluginReference] Plugin RaidableBases;
+
+        private Dictionary<ulong, Vector3> playerHomes = new();
+        private List<Vector3> heliTowers = new();
+        private Dictionary<ulong, Vector3> playerRaids = new();
+
+        #region Hooks
+        void OnRaidableBaseStarted(Vector3 position, BasePlayer owner)
+        {
+            if (owner != null)
+                playerRaids[owner.userID] = position;
+        }
+        #endregion
+
+        #region Commands
+        [ChatCommand("sethome")]
+        void SetHome(BasePlayer player, string command, string[] args)
+        {
+            if (!HasPermission(player, "teleportplugin.use")) return;
+            playerHomes[player.userID] = player.transform.position;
+            player.ChatMessage("Home set!");
+        }
+
+        [ChatCommand("home")]
+        void GoHome(BasePlayer player, string command, string[] args)
+        {
+            if (!HasPermission(player, "teleportplugin.use")) return;
+            if (!playerHomes.ContainsKey(player.userID))
+            {
+                player.ChatMessage("You have not set a home yet.");
+                return;
+            }
+            TeleportPlayer(player, playerHomes[player.userID]);
+        }
+
+        [ChatCommand("removehome")]
+        void RemoveHome(BasePlayer player, string command, string[] args)
+        {
+            if (!HasPermission(player, "teleportplugin.use")) return;
+            if (playerHomes.Remove(player.userID))
+                player.ChatMessage("Home removed.");
+            else
+                player.ChatMessage("You don't have a home set.");
+        }
+
+        [ChatCommand("tprb")]
+        void TeleportToRaid(BasePlayer player, string command, string[] args)
+        {
+            if (!HasPermission(player, "teleportplugin.use")) return;
+            if (!playerRaids.ContainsKey(player.userID))
+            {
+                player.ChatMessage("You don’t have a raid to teleport to.");
+                return;
+            }
+            TeleportPlayer(player, playerRaids[player.userID]);
+        }
+
+        [ChatCommand("tpheli")]
+        void TeleportToHeli(BasePlayer player, string command, string[] args)
+        {
+            if (!HasPermission(player, "teleportplugin.use")) return;
+            if (heliTowers.Count == 0)
+            {
+                player.ChatMessage("No heli towers have been set.");
+                return;
+            }
+
+            Vector3 destination = heliTowers[Random.Range(0, heliTowers.Count)];
+            TeleportPlayer(player, destination);
+        }
+
+        [ChatCommand("addhelitower")]
+        void AddHeliTower(BasePlayer player, string command, string[] args)
+        {
+            if (!HasPermission(player, "teleportplugin.admin")) return;
+            heliTowers.Add(player.transform.position);
+            player.ChatMessage("Heli tower added at your location.");
+        }
+
+        [ChatCommand("removehelitower")]
+        void RemoveHeliTower(BasePlayer player, string command, string[] args)
+        {
+            if (!HasPermission(player, "teleportplugin.admin")) return;
+            if (heliTowers.Count == 0)
+            {
+                player.ChatMessage("No heli towers to remove.");
+                return;
+            }
+            heliTowers.RemoveAt(heliTowers.Count - 1);
+            player.ChatMessage("Last heli tower removed.");
+        }
+        #endregion
+
+        #region Teleport
+        private void TeleportPlayer(BasePlayer player, Vector3 destination)
+        {
+            player.Teleport(destination);
+            player.ChatMessage("Teleporting...");
+        }
+        #endregion
+
+        #region Permissions
+        private bool HasPermission(BasePlayer player, string perm)
+        {
+            if (permission.UserHasPermission(player.UserIDString, perm))
+                return true;
+            player.ChatMessage("You don't have permission to use this.");
+            return false;
+        }
+
+        void Init()
+        {
+            permission.RegisterPermission("teleportplugin.use", this);
+            permission.RegisterPermission("teleportplugin.admin", this);
+        }
+        #endregion
+    }
+} 
