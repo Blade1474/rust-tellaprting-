@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using Oxide.Core;
 using Oxide.Core.Plugins;
@@ -5,30 +6,140 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("CustomTeleportManager", "Blade", "1.0.0")]
-    [Description("Teleport to raid bases, heli towers, and home locations.")]
+    [Info("CustomTeleportManager", "Blade", "1.1.0")]
+    [Description("Teleport to raid bases, heli towers, home locations, and friends with cooldowns and limits.")]
     public class CustomTeleportManager : RustPlugin
     {
         [PluginReference] Plugin RaidableBases;
 
-        private Dictionary<ulong, Vector3> playerHomes = new();
-        private List<Vector3> heliTowers = new();
-        private Dictionary<ulong, Vector3> playerRaids = new();
+        private StoredData storedData;
+
+        private Dictionary<ulong, Vector3> playerHomes => storedData.PlayerHomes;
+        private List<Vector3> heliTowers => storedData.HeliTowers;
+        private Dictionary<ulong, Vector3> playerRaids => storedData.PlayerRaids;
+        private Dictionary<ulong, DateTime> lastTeleportTimes = new();
+        private Dictionary<ulong, int> homeTeleportCounts => storedData.HomeTeleportCounts;
+        private Dictionary<ulong, FriendRequest> pendingFriendRequests = new();
+
+        #region Data Classes
+
+        private class StoredData
+        {
+            public Dictionary<ulong, Vector3> PlayerHomes = new();
+            public List<Vector3> HeliTowers = new();
+            public Dictionary<ulong, Vector3> PlayerRaids = new();
+            public Dictionary<ulong, int> HomeTeleportCounts = new();
+            public Dictionary<ulong, long> LastTeleportTicks = new();
+        }
+
+        private class FriendRequest
+        {
+            public ulong RequesterId;
+            public Timer ExpiryTimer;
+        }
+
+        #endregion
+
+        #region Config
+
+        private ConfigData config;
+
+        private class ConfigData
+        {
+            public Dictionary<string, int> VipCooldowns = new()
+            {
+                ["default"] = 300,
+                ["vip1"] = 180,
+                ["vip2"] = 60
+            };
+
+            public int HomeTeleportLimit = 3;
+            public int FriendRequestTimeoutSeconds = 30;
+        }
+
+        protected override void LoadDefaultConfig()
+        {
+            config = new ConfigData();
+            SaveConfig();
+        }
+
+        protected override void LoadConfig()
+        {
+            base.LoadConfig();
+            try
+            {
+                config = Config.ReadObject<ConfigData>();
+                if (config == null) throw new Exception();
+            }
+            catch
+            {
+                PrintWarning("Could not read config, loading default.");
+                LoadDefaultConfig();
+            }
+        }
+
+        protected override void SaveConfig() => Config.WriteObject(config);
+
+        #endregion
 
         #region Hooks
+
+        void Init()
+        {
+            permission.RegisterPermission("teleportplugin.use", this);
+            permission.RegisterPermission("teleportplugin.admin", this);
+            permission.RegisterPermission("vip1", this);
+            permission.RegisterPermission("vip2", this);
+        }
+
+        void OnServerInitialized()
+        {
+            LoadData();
+
+            // Convert stored ticks to DateTime for cooldown tracking
+            if (storedData.LastTeleportTicks != null)
+            {
+                foreach (var kvp in storedData.LastTeleportTicks)
+                    lastTeleportTimes[kvp.Key] = new DateTime(kvp.Value);
+            }
+
+            // Reset daily home teleport counts every 24 hours
+            timer.Every(86400f, () =>
+            {
+                homeTeleportCounts.Clear();
+                SaveData();
+            });
+        }
+
         void OnRaidableBaseStarted(Vector3 position, BasePlayer owner)
         {
             if (owner != null)
+            {
                 playerRaids[owner.userID] = position;
+                SaveData();
+            }
         }
+
+        void Unload()
+        {
+            foreach (var req in pendingFriendRequests.Values)
+                req.ExpiryTimer?.Destroy();
+
+            pendingFriendRequests.Clear();
+            SaveData();
+        }
+
         #endregion
 
         #region Commands
+
         [ChatCommand("sethome")]
         void SetHome(BasePlayer player, string command, string[] args)
         {
             if (!HasPermission(player, "teleportplugin.use")) return;
+
             playerHomes[player.userID] = player.transform.position;
+            SaveData();
             player.ChatMessage("Home set!");
         }
 
@@ -36,55 +147,85 @@ namespace Oxide.Plugins
         void GoHome(BasePlayer player, string command, string[] args)
         {
             if (!HasPermission(player, "teleportplugin.use")) return;
+
             if (!playerHomes.ContainsKey(player.userID))
             {
                 player.ChatMessage("You have not set a home yet.");
                 return;
             }
+
+            if (GetHomeTeleportCount(player) >= config.HomeTeleportLimit)
+            {
+                player.ChatMessage($"You have reached the daily limit of {config.HomeTeleportLimit} home teleports.");
+                return;
+            }
+
+            if (!CanTeleport(player)) return;
+
             TeleportPlayer(player, playerHomes[player.userID]);
+            IncrementHomeTeleportCount(player);
+            UpdateLastTeleport(player);
+            SaveData();
         }
 
         [ChatCommand("removehome")]
         void RemoveHome(BasePlayer player, string command, string[] args)
         {
             if (!HasPermission(player, "teleportplugin.use")) return;
+
             if (playerHomes.Remove(player.userID))
+            {
+                SaveData();
                 player.ChatMessage("Home removed.");
+            }
             else
+            {
                 player.ChatMessage("You don't have a home set.");
+            }
         }
 
         [ChatCommand("tprb")]
         void TeleportToRaid(BasePlayer player, string command, string[] args)
         {
             if (!HasPermission(player, "teleportplugin.use")) return;
+
             if (!playerRaids.ContainsKey(player.userID))
             {
                 player.ChatMessage("You don’t have a raid to teleport to.");
                 return;
             }
+
+            if (!CanTeleport(player)) return;
+
             TeleportPlayer(player, playerRaids[player.userID]);
+            UpdateLastTeleport(player);
         }
 
         [ChatCommand("tpheli")]
         void TeleportToHeli(BasePlayer player, string command, string[] args)
         {
             if (!HasPermission(player, "teleportplugin.use")) return;
+
             if (heliTowers.Count == 0)
             {
                 player.ChatMessage("No heli towers have been set.");
                 return;
             }
 
-            Vector3 destination = heliTowers[Random.Range(0, heliTowers.Count)];
+            if (!CanTeleport(player)) return;
+
+            Vector3 destination = heliTowers[UnityEngine.Random.Range(0, heliTowers.Count)];
             TeleportPlayer(player, destination);
+            UpdateLastTeleport(player);
         }
 
         [ChatCommand("addhelitower")]
         void AddHeliTower(BasePlayer player, string command, string[] args)
         {
             if (!HasPermission(player, "teleportplugin.admin")) return;
+
             heliTowers.Add(player.transform.position);
+            SaveData();
             player.ChatMessage("Heli tower added at your location.");
         }
 
@@ -92,38 +233,224 @@ namespace Oxide.Plugins
         void RemoveHeliTower(BasePlayer player, string command, string[] args)
         {
             if (!HasPermission(player, "teleportplugin.admin")) return;
+
             if (heliTowers.Count == 0)
             {
                 player.ChatMessage("No heli towers to remove.");
                 return;
             }
+
             heliTowers.RemoveAt(heliTowers.Count - 1);
+            SaveData();
             player.ChatMessage("Last heli tower removed.");
         }
-        #endregion
 
-        #region Teleport
-        private void TeleportPlayer(BasePlayer player, Vector3 destination)
+        [ChatCommand("tpfriend")]
+        void TeleportToFriend(BasePlayer player, string command, string[] args)
         {
-            player.Teleport(destination);
-            player.ChatMessage("Teleporting...");
+            if (!HasPermission(player, "teleportplugin.use")) return;
+
+            if (args.Length != 1)
+            {
+                player.ChatMessage("Usage: /tpfriend <playername>");
+                return;
+            }
+
+            BasePlayer friend = FindPlayerByName(args[0]);
+            if (friend == null)
+            {
+                player.ChatMessage("Player not found.");
+                return;
+            }
+
+            if (friend.userID == player.userID)
+            {
+                player.ChatMessage("You cannot teleport to yourself.");
+                return;
+            }
+
+            if (!CanTeleport(player)) return;
+
+            if (pendingFriendRequests.ContainsKey(friend.userID))
+            {
+                player.ChatMessage($"{friend.displayName} already has a pending teleport request.");
+                return;
+            }
+
+            // Send request
+            pendingFriendRequests[friend.userID] = new FriendRequest
+            {
+                RequesterId = player.userID,
+                ExpiryTimer = timer.Once(config.FriendRequestTimeoutSeconds, () => ExpireFriendRequest(friend.userID))
+            };
+
+            player.ChatMessage($"Teleport request sent to {friend.displayName}.");
+            friend.ChatMessage($"{player.displayName} wants to teleport to you. Type /tpaccept to accept or /tpdeny to deny.");
         }
+
+        [ChatCommand("tpaccept")]
+        void AcceptFriendTeleport(BasePlayer player, string command, string[] args)
+        {
+            if (!pendingFriendRequests.ContainsKey(player.userID))
+            {
+                player.ChatMessage("You have no pending teleport requests.");
+                return;
+            }
+
+            var request = pendingFriendRequests[player.userID];
+            BasePlayer requester = BasePlayer.FindByID(request.RequesterId);
+
+            if (requester == null)
+            {
+                player.ChatMessage("Requester is offline.");
+                pendingFriendRequests.Remove(player.userID);
+                return;
+            }
+
+            if (!CanTeleport(requester))
+            {
+                player.ChatMessage("Requester cannot teleport now due to cooldown.");
+                return;
+            }
+
+            TeleportPlayer(requester, player.transform.position);
+            UpdateLastTeleport(requester);
+
+            requester.ChatMessage($"{player.displayName} accepted your teleport request.");
+            player.ChatMessage("Teleport request accepted.");
+
+            request.ExpiryTimer?.Destroy();
+            pendingFriendRequests.Remove(player.userID);
+            SaveData();
+        }
+
+        [ChatCommand("tpdeny")]
+        void DenyFriendTeleport(BasePlayer player, string command, string[] args)
+        {
+            if (!pendingFriendRequests.ContainsKey(player.userID))
+            {
+                player.ChatMessage("You have no pending teleport requests.");
+                return;
+            }
+
+            var request = pendingFriendRequests[player.userID];
+            BasePlayer requester = BasePlayer.FindByID(request.RequesterId);
+
+            if (requester != null)
+                requester.ChatMessage($"{player.displayName} denied your teleport request.");
+
+            player.ChatMessage("Teleport request denied.");
+
+            request.ExpiryTimer?.Destroy();
+            pendingFriendRequests.Remove(player.userID);
+        }
+
         #endregion
 
-        #region Permissions
+        #region Helpers
+
+        private BasePlayer FindPlayerByName(string name)
+        {
+            foreach (var player in BasePlayer.activePlayerList)
+            {
+                if (player.displayName.Equals(name, StringComparison.OrdinalIgnoreCase))
+                    return player;
+            }
+            return null;
+        }
+
         private bool HasPermission(BasePlayer player, string perm)
         {
-            if (permission.UserHasPermission(player.UserIDString, perm))
-                return true;
-            player.ChatMessage("You don't have permission to use this.");
-            return false;
+            if (!permission.UserHasPermission(player.UserIDString, perm))
+            {
+                player.ChatMessage("You do not have permission to use this command.");
+                return false;
+            }
+            return true;
         }
 
-        void Init()
+        private bool CanTeleport(BasePlayer player)
         {
-            permission.RegisterPermission("teleportplugin.use", this);
-            permission.RegisterPermission("teleportplugin.admin", this);
+            if (!permission.UserHasPermission(player.UserIDString, "teleportplugin.use"))
+            {
+                player.ChatMessage("You do not have permission to teleport.");
+                return false;
+            }
+
+            int cooldown = config.VipCooldowns["default"];
+            if (permission.UserHasPermission(player.UserIDString, "vip2"))
+                cooldown = config.VipCooldowns["vip2"];
+            else if (permission.UserHasPermission(player.UserIDString, "vip1"))
+                cooldown = config.VipCooldowns["vip1"];
+
+            if (lastTeleportTimes.TryGetValue(player.userID, out DateTime lastTime))
+            {
+                double secondsPassed = (DateTime.UtcNow - lastTime).TotalSeconds;
+                if (secondsPassed < cooldown)
+                {
+                    player.ChatMessage($"You must wait {(int)(cooldown - secondsPassed)} seconds before teleporting again.");
+                    return false;
+                }
+            }
+
+            return true;
         }
+
+        private void TeleportPlayer(BasePlayer player, Vector3 position)
+        {
+            player.Teleport(position);
+            player.ChatMessage("Teleported!");
+        }
+
+        private void UpdateLastTeleport(BasePlayer player)
+        {
+            lastTeleportTimes[player.userID] = DateTime.UtcNow;
+            storedData.LastTeleportTicks[player.userID] = DateTime.UtcNow.Ticks;
+            SaveData();
+        }
+
+        private int GetHomeTeleportCount(BasePlayer player)
+        {
+            if (homeTeleportCounts.TryGetValue(player.userID, out int count))
+                return count;
+            return 0;
+        }
+
+        private void IncrementHomeTeleportCount(BasePlayer player)
+        {
+            int count = GetHomeTeleportCount(player);
+            homeTeleportCounts[player.userID] = count + 1;
+            SaveData();
+        }
+
+        private void ExpireFriendRequest(ulong friendId)
+        {
+            if (pendingFriendRequests.TryGetValue(friendId, out FriendRequest request))
+            {
+                BasePlayer requester = BasePlayer.FindByID(request.RequesterId);
+                BasePlayer friend = BasePlayer.FindByID(friendId);
+
+                if (requester != null)
+                    requester.ChatMessage($"Your teleport request to {friend?.displayName ?? "Unknown"} expired.");
+
+                if (friend != null)
+                    friend.ChatMessage("You did not respond to the teleport request in time.");
+
+                request.ExpiryTimer?.Destroy();
+                pendingFriendRequests.Remove(friendId);
+            }
+        }
+
+        private void LoadData()
+        {
+            storedData = Interface.Oxide.DataFileSystem.ReadObject<StoredData>(Name) ?? new StoredData();
+        }
+
+        private void SaveData()
+        {
+            Interface.Oxide.DataFileSystem.WriteObject(Name, storedData);
+        }
+
         #endregion
     }
-} 
+}
